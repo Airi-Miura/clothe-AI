@@ -1,0 +1,32 @@
+# APIキー
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# 仮想環境
+.venv/
+venv/
+
+# 実験データ
+*.csv
+*.xlsx
+
+# 画像
+*.jpg
+*.jpeg
+*.png
+
+# Word・PDF
+*.docx
+*.pdf
+
+# Streamlit
+.streamlit/
+
+# 結果フォルダ
+result*/
+
+.claude/
+test_gemini.py
