@@ -1,0 +1,17 @@
+[
+  {
+    "method": "manual",
+    "total_clo": 0.35,
+    "image_name": "スクリーンショット 2026-06-26 101706.png",
+    "image_type": "image/png",
+    "clo": 0.35,
+    "registered_at": "2026-06-26 15:34:36",
+    "image_path": "C:\\Users\\airic\\Desktop\\研究室\\卒研\\モデル\\closet_images\\20260626_153436_9c6d0053_2026-06-26_101706.png",
+    "name": "testワンピース",
+    "categories": [
+      "ワンピース"
+    ],
+    "confidence": 0.0,
+    "category": "ワンピース"
+  }
+]

@@ -9,6 +9,20 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+from clothing_classifier import (
+    CLOTHING_CATEGORY_CANDIDATES,
+    classify_clothing_image,
+    load_clip_classifier,
+)
+from closet_db import (
+    CLOSET_DB_PATH,
+    CLOSET_IMAGE_DIR,
+    delete_closet_item,
+    load_closet_items,
+    save_closet_items,
+    save_uploaded_closet_image,
+)
+
 from model import (
     ACTIVITY_OPTIONS,
     CLO_DB,
@@ -25,7 +39,6 @@ from model import (
     build_daily_segments_from_trips,
     calculate_pmv_series,
     calculate_total_clo,
-    classify_clothing_categories_from_image,
     expand_segments_to_time_level,
     get_initial_personal_clo_offset,
     get_recommendation_message,
@@ -118,16 +131,24 @@ if "geocode_result" not in st.session_state:
     st.session_state.geocode_result = None
 
 if "closet_items" not in st.session_state:
-    st.session_state.closet_items = []
+    st.session_state.closet_items = load_closet_items()
 
-if "closet_selected_categories" not in st.session_state:
-    st.session_state.closet_selected_categories = []
+if "closet_classification_result" not in st.session_state:
+    st.session_state.closet_classification_result = None
 
-if "detected_clothing_categories" not in st.session_state:
-    st.session_state.detected_clothing_categories = []
+if "closet_selected_category" not in st.session_state:
+    st.session_state.closet_selected_category = CLOTHING_CATEGORY_CANDIDATES[0]
 
-if "gemini_detection_message" not in st.session_state:
-    st.session_state.gemini_detection_message = None
+if "closet_category_method" not in st.session_state:
+    st.session_state.closet_category_method = "manual"
+
+if "closet_last_image_name" not in st.session_state:
+    st.session_state.closet_last_image_name = None
+
+
+@st.cache_resource(show_spinner=False)
+def get_clothing_classifier_resource():
+    return load_clip_classifier()
 
 
 def add_trip_row():
@@ -628,85 +649,126 @@ with tab4:
 with tab5:
     st.subheader("クローゼット登録")
 
-    # Apply the pending Gemini result before the multiselect widget is created.
-    if st.session_state.detected_clothing_categories:
-        st.session_state.closet_selected_categories = st.session_state.detected_clothing_categories
-        st.session_state.detected_clothing_categories = []
+    uploaded_file = st.file_uploader(
+        "服画像",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=False,
+        key="closet_image_uploader",
+    )
+    item_name = st.text_input("登録名", key="closet_item_name")
 
-    with st.form("closet_register_form", clear_on_submit=False):
-        uploaded_file = st.file_uploader(
-            "服画像",
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=False,
+    if uploaded_file is not None:
+        if st.session_state.closet_last_image_name != uploaded_file.name:
+            st.session_state.closet_last_image_name = uploaded_file.name
+            st.session_state.closet_classification_result = None
+            st.session_state.closet_selected_category = CLOTHING_CATEGORY_CANDIDATES[0]
+            st.session_state.closet_category_method = "manual"
+
+        image_bytes = uploaded_file.getvalue()
+        st.image(image_bytes, caption=uploaded_file.name, width=260)
+
+        if st.button("画像から自動判定", key="classify_closet_image"):
+            try:
+                classifier_resource = get_clothing_classifier_resource()
+                if classifier_resource.get("warning"):
+                    st.warning(classifier_resource["warning"])
+                result = classify_clothing_image(
+                    image_bytes,
+                    model_bundle=classifier_resource,
+                    categories=CLOTHING_CATEGORY_CANDIDATES,
+                    clo_dict=CLO_DB,
+                )
+                st.session_state.closet_classification_result = result
+                st.session_state.closet_selected_category = result["category"]
+                st.session_state.closet_category_method = result.get("method", "fashionclip")
+                st.rerun()
+            except Exception as exc:
+                st.session_state.closet_classification_result = None
+                st.session_state.closet_category_method = "manual"
+                st.error(f"ローカル画像分類に失敗しました。手動でカテゴリを選択してください。詳細: {exc}")
+
+        result = st.session_state.closet_classification_result
+        if result:
+            st.markdown("### AI判定結果")
+            r1, r2, r3 = st.columns(3)
+            r1.metric("判定カテゴリ", result["category"])
+            r2.metric("CLO値", f"{float(result['clo']):.2f}")
+            r3.metric("信頼度", f"{float(result['confidence']) * 100:.1f}%")
+
+            st.markdown("#### 上位3候補")
+            st.dataframe(pd.DataFrame(result["top_candidates"]), use_container_width=True)
+
+            if st.button("この判定を採用", key="adopt_closet_prediction"):
+                st.session_state.closet_selected_category = result["category"]
+                st.session_state.closet_category_method = result.get("method", "fashionclip")
+                st.success("AI判定を採用しました。")
+
+        manual_category = st.selectbox(
+            "手動で修正する",
+            options=CLOTHING_CATEGORY_CANDIDATES,
+            index=CLOTHING_CATEGORY_CANDIDATES.index(st.session_state.closet_selected_category)
+            if st.session_state.closet_selected_category in CLOTHING_CATEGORY_CANDIDATES else 0,
+            key="closet_manual_category_select",
         )
-        item_name = st.text_input("登録名")
-        selected_categories = st.multiselect(
-            "衣服カテゴリ",
-            options=list(CLO_DB.keys()),
-            key="closet_selected_categories",
-        )
+        if manual_category != st.session_state.closet_selected_category:
+            st.session_state.closet_selected_category = manual_category
+            st.session_state.closet_category_method = "manual"
 
-        clothing_categories = list(selected_categories)
-        total_clo = calculate_total_clo(clothing_categories)
-        st.metric("総CLO値", f"{total_clo:.2f}")
+        final_category = st.session_state.closet_selected_category
+        final_clo = float(CLO_DB.get(final_category, 0.0))
+        confidence = 0.0
+        if result and result.get("category") == final_category:
+            confidence = float(result.get("confidence", 0.0))
 
-        if st.session_state.gemini_detection_message:
-            st.info(st.session_state.gemini_detection_message)
-
-        auto_detected = st.form_submit_button("画像から自動判定")
-        submitted = st.form_submit_button("登録する")
-
-        if auto_detected:
-            if uploaded_file is None:
-                st.error("服画像をアップロードしてください。")
-            else:
-                try:
-                    detected_categories, _ = classify_clothing_categories_from_image(
-                        uploaded_file.getvalue(),
-                        mime_type=uploaded_file.type,
-                    )
-                    st.session_state.detected_clothing_categories = detected_categories
-                    if detected_categories:
-                        st.session_state.gemini_detection_message = "Gemini判定: " + "、".join(detected_categories)
-                    else:
-                        st.session_state.gemini_detection_message = "Geminiで該当カテゴリを判定できませんでした。手動で選択してください。"
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-
-        if submitted:
-            if uploaded_file is None:
-                st.error("服画像をアップロードしてください。")
-            elif not item_name.strip():
+        st.metric("登録されるCLO値", f"{final_clo:.2f}")
+        if st.button("登録する", key="register_closet_item"):
+            if not item_name.strip():
                 st.error("登録名を入力してください。")
-            elif not clothing_categories:
-                st.error("衣服カテゴリを1つ以上選択してください。")
             else:
+                image_path = save_uploaded_closet_image(image_bytes, uploaded_file.name)
                 st.session_state.closet_items.append({
                     "name": item_name.strip(),
-                    "image": uploaded_file.getvalue(),
+                    "image_path": image_path,
                     "image_name": uploaded_file.name,
                     "image_type": uploaded_file.type,
-                    "categories": clothing_categories,
-                    "total_clo": total_clo,
+                    "category": final_category,
+                    "categories": [final_category],
+                    "clo": final_clo,
+                    "total_clo": final_clo,
+                    "method": st.session_state.closet_category_method,
+                    "confidence": confidence,
+                    "registered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 })
+                save_closet_items(st.session_state.closet_items)
                 st.success("クローゼットに登録しました。")
+    else:
+        st.info("服画像をアップロードすると、FashionCLIP/CLIPでカテゴリを推定できます。")
+
     st.markdown("### 登録済みクローゼット一覧")
+    st.caption(f"保存先: {CLOSET_DB_PATH}")
     if not st.session_state.closet_items:
         st.info("登録済みの服はまだありません。")
     else:
         for i, item in enumerate(st.session_state.closet_items):
             with st.container(border=True):
-                c1, c2, c3, c4, c5 = st.columns([1.2, 1.4, 2.4, 1.0, 0.9])
+                c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1.3, 1.5, 0.8, 1.0, 0.8])
                 with c1:
-                    st.image(item["image"], caption=item.get("image_name", "服画像"), use_container_width=True)
+                    image_source = item.get("image_path") or item.get("image")
+                    if image_source:
+                        st.image(image_source, caption=item.get("image_name", "服画像"), use_container_width=True)
+                    else:
+                        st.caption("画像なし")
                 with c2:
-                    st.write(item["name"])
+                    st.write(item.get("name", ""))
+                    st.caption(item.get("registered_at", ""))
                 with c3:
-                    st.write("、".join(item["categories"]))
+                    st.write(item.get("category", "、".join(item.get("categories", []))))
+                    st.caption(f"判定方法: {item.get('method', 'manual')}")
                 with c4:
-                    st.metric("総CLO", f"{float(item['total_clo']):.2f}")
+                    st.metric("CLO", f"{float(item.get('clo', item.get('total_clo', 0.0))):.2f}")
                 with c5:
+                    st.metric("信頼度", f"{float(item.get('confidence', 0.0)) * 100:.1f}%")
+                with c6:
                     if st.button("削除", key=f"delete_closet_item_{i}", use_container_width=True):
-                        st.session_state.closet_items.pop(i)
+                        st.session_state.closet_items = delete_closet_item(st.session_state.closet_items, i)
                         st.rerun()

@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import base64
-import os
-import re
 import math
 import urllib.parse
 import urllib.request
@@ -137,137 +134,34 @@ FEEDBACK_SCORE_MAP = {
 PERSONAL_CLO_OFFSET_MIN = -0.5
 PERSONAL_CLO_OFFSET_MAX = 0.5
 CLO_DB = {
-    "半袖Tシャツ": 0.15,
-    "長袖Tシャツ": 0.25,
+    "半袖Tシャツ": 0.08,
+    "長袖Tシャツ": 0.20,
     "シャツ": 0.25,
-    "パーカー": 0.30,
-    "セーター": 0.37,
-    "ダウンジャケット": 0.60,
-    "長ズボン": 0.36,
-    "半ズボン": 0.08,
-    "スカート": 0.20,
-    "靴下": 0.04,
+    "ブラウス": 0.20,
+    "セーター": 0.30,
+    "カーディガン": 0.30,
+    "パーカー": 0.35,
+    "フリース": 0.40,
+    "薄手ジャケット": 0.35,
+    "厚手ジャケット": 0.60,
+    "コート": 0.70,
+    "ダウンジャケット": 0.80,
+    "ジーンズ": 0.25,
+    "スラックス": 0.25,
+    "ショートパンツ": 0.10,
+    "スカート": 0.15,
+    "ワンピース": 0.35,
 }
+CLO_DICT = CLO_DB
+
+
+def get_clo_value(category: str) -> float:
+    return float(CLO_DB.get(category, 0.0))
 
 
 def calculate_total_clo(categories: list[str]) -> float:
-    return round(sum(float(CLO_DB.get(category, 0.0)) for category in categories), 2)
+    return round(sum(get_clo_value(category) for category in categories), 2)
 
-
-
-
-def load_gemini_env(env_path: Optional[str] = None) -> None:
-    if env_path is None:
-        env_path = os.path.join(os.path.dirname(__file__), ".env")
-    if not os.path.exists(env_path):
-        return
-
-    with open(env_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
-                os.environ[key] = value
-
-
-def _extract_gemini_text(response: dict) -> str:
-    candidates = response.get("candidates", [])
-    if not candidates:
-        return ""
-    parts = candidates[0].get("content", {}).get("parts", [])
-    return "\n".join(part.get("text", "") for part in parts if part.get("text"))
-
-
-def _parse_clothing_categories(text: str) -> list[str]:
-    cleaned = text.strip()
-    cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
-    cleaned = re.sub(r"```$", "", cleaned).strip()
-
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            raw_categories = parsed.get("categories", [])
-        elif isinstance(parsed, list):
-            raw_categories = parsed
-        else:
-            raw_categories = []
-    except Exception:
-        raw_categories = [category for category in CLO_DB.keys() if category in cleaned]
-
-    categories = []
-    for category in raw_categories:
-        if category in CLO_DB and category not in categories:
-            categories.append(category)
-    return categories
-
-
-def classify_clothing_categories_from_image(
-    image_bytes: bytes,
-    mime_type: Optional[str] = None,
-    api_key: Optional[str] = None,
-    model_name: Optional[str] = None,
-    timeout: int = 30,
-) -> tuple[list[str], str]:
-    load_gemini_env()
-    api_key = api_key or os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY が .env に設定されていません。")
-
-    model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-    mime_type = mime_type or "image/jpeg"
-    category_list = "、".join(CLO_DB.keys())
-    prompt = (
-        "あなたは衣服画像をCLO計算用カテゴリに分類するアシスタントです。"
-        "画像に写っている衣服を、次のカテゴリだけから選んでください。"
-        f"カテゴリ: {category_list}\n"
-        "見えない衣服や確信できない衣服は選ばないでください。"
-        "返答はJSONのみで、形式は {\"categories\": [\"カテゴリ名\"]} としてください。"
-    )
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": base64.b64encode(image_bytes).decode("ascii"),
-                        }
-                    },
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.1,
-            "response_mime_type": "application/json",
-        },
-    }
-    encoded_model = urllib.parse.quote(model_name, safe="")
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{encoded_model}:generateContent?key={urllib.parse.quote(api_key)}"
-    )
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            response = json.loads(res.read().decode("utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"Geminiによる画像判定に失敗しました: {exc}") from exc
-
-    response_text = _extract_gemini_text(response)
-    categories = _parse_clothing_categories(response_text)
-    return categories, response_text
 
 def get_initial_personal_clo_offset(thermal_type: str) -> float:
     return float(THERMAL_TYPE_TO_OFFSET.get(thermal_type, 0.0))
