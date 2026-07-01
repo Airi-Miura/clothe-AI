@@ -26,6 +26,8 @@ from closet_db import (
 from model import (
     ACTIVITY_OPTIONS,
     CLO_DB,
+    DELTA_T_COEFFS,
+    DELTA_T_MAX_MINUTES,
     ENVIRONMENT_OPTIONS,
     FEEDBACK_OPTIONS,
     FEEDBACK_SCORE_MAP,
@@ -39,6 +41,8 @@ from model import (
     build_daily_segments_from_trips,
     calculate_pmv_series,
     calculate_total_clo,
+    compare_clo_recommendation,
+    compare_pmv_transition,
     expand_segments_to_time_level,
     get_initial_personal_clo_offset,
     get_recommendation_message,
@@ -245,6 +249,99 @@ def plot_research_figure(minute_df: pd.DataFrame, title: str):
     return fig
 
 
+def _evaluation_debug_anomalies(minute_df: pd.DataFrame, recommendation_comparison: dict, clo_min: float, clo_max: float) -> list[str]:
+    warnings = []
+    if minute_df is None or minute_df.empty:
+        return warnings
+
+    checks = [
+        ("Teff", "teff", 0.0, 50.0),
+        ("ΔT", "delta_t", -20.0, 30.0),
+    ]
+    if "estimated_temp" in minute_df.columns and "delta_t" in minute_df.columns:
+        ttarget = pd.to_numeric(minute_df["estimated_temp"], errors="coerce") + pd.to_numeric(minute_df["delta_t"], errors="coerce")
+        if ttarget.min() < 0 or ttarget.max() > 50:
+            warnings.append(f"Ttarget が通常範囲外です: min={ttarget.min():.3f}, max={ttarget.max():.3f}")
+
+    for label, col, lower, upper in checks:
+        if col in minute_df.columns:
+            values = pd.to_numeric(minute_df[col], errors="coerce").dropna()
+            if not values.empty and (values.min() < lower or values.max() > upper):
+                warnings.append(f"{label} が通常範囲外です: min={values.min():.3f}, max={values.max():.3f}")
+
+    for method_key, method_name in [("conventional", "従来手法"), ("proposed", "提案手法")]:
+        result = recommendation_comparison.get(method_key, {})
+        best_clo = float(result.get("best_clo", 0.0))
+        best_pmv = result.get("best_pmv")
+        if abs(best_clo - float(clo_max)) < 1e-9:
+            warnings.append(f"{method_name}: 推奨CLOが探索上限 {clo_max:.2f} に張り付いています。")
+        if abs(best_clo - float(clo_min)) < 1e-9:
+            warnings.append(f"{method_name}: 推奨CLOが探索下限 {clo_min:.2f} に張り付いています。")
+        if best_pmv is not None and abs(float(best_pmv)) > 3.0:
+            warnings.append(f"{method_name}: PMV が -3〜3 を大きく超えています（PMV={float(best_pmv):.3f}）。")
+
+    return warnings
+
+
+def _build_teff_step_debug_df(minute_df: pd.DataFrame, alpha_value: float, dt_min: float = 1.0, rows: int = 10) -> pd.DataFrame:
+    debug_rows = []
+    if minute_df is None or minute_df.empty:
+        return pd.DataFrame()
+
+    for i in range(min(rows, len(minute_df))):
+        tenv = float(minute_df["estimated_temp"].iloc[i])
+        delta_t = float(minute_df["delta_t"].iloc[i]) if "delta_t" in minute_df.columns else 0.0
+        ttarget = tenv + delta_t
+        teff_after = float(minute_df["teff"].iloc[i])
+        teff_before = teff_after if i == 0 else float(minute_df["teff"].iloc[i - 1])
+        debug_rows.append({
+            "step": i,
+            "時刻": minute_df["datetime"].iloc[i] if "datetime" in minute_df.columns else i,
+            "Tenv": tenv,
+            "ΔT": delta_t,
+            "Ttarget": ttarget,
+            "Teff_before": teff_before,
+            "α": float(alpha_value),
+            "Δt": float(dt_min),
+            "Teff_after": teff_after,
+            "遷移方向": minute_df["transition_direction"].iloc[i] if "transition_direction" in minute_df.columns else None,
+            "t_since_transition": minute_df["transition_elapsed_min"].iloc[i] if "transition_elapsed_min" in minute_df.columns else None,
+            "t_clip": minute_df["delta_t_elapsed_clipped_min"].iloc[i] if "delta_t_elapsed_clipped_min" in minute_df.columns else None,
+        })
+    return pd.DataFrame(debug_rows)
+
+
+def _build_pmv_input_debug_df(minute_df: pd.DataFrame, pmv_df: pd.DataFrame, method_name: str, input_temp_col: str, clo_value: float, rows: int = 20) -> pd.DataFrame:
+    debug_df = pd.DataFrame({
+        "手法": method_name,
+        "時刻": minute_df["datetime"] if "datetime" in minute_df.columns else minute_df.index,
+        "tdb": pd.to_numeric(minute_df[input_temp_col], errors="coerce"),
+        "tr": pd.to_numeric(minute_df[input_temp_col], errors="coerce"),
+        "rh": pd.to_numeric(minute_df["rh"], errors="coerce"),
+        "v": pd.to_numeric(minute_df["v"], errors="coerce"),
+        "met": pd.to_numeric(minute_df["met"], errors="coerce"),
+        "clo": float(clo_value),
+        "PMV計算結果": pmv_df["pmv"] if "pmv" in pmv_df.columns else None,
+    })
+    return debug_df.head(rows)
+
+
+def _summarize_search_results(search_results: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(search_results)
+    if df.empty:
+        return df
+    ok_df = df[df["status"] == "ok"].copy()
+    head_df = df.head(10)
+    tail_df = df.tail(10)
+    best_df = ok_df.sort_values("error").head(10) if not ok_df.empty else pd.DataFrame()
+    summary = pd.concat([
+        head_df.assign(表示区分="最初の10件"),
+        tail_df.assign(表示区分="最後の10件"),
+        best_df.assign(表示区分="error上位10件"),
+    ], ignore_index=True)
+    return summary.drop_duplicates(subset=["clo", "表示区分"])
+
+
 st.title("🌡️ 環境温度推定 & CZ判定アプリ")
 st.caption("主要な移動だけ入力し、徒歩・電車などの細かい区間はアプリ側で自動補完します。")
 
@@ -338,12 +435,13 @@ preset["indoor_v"] = st.sidebar.number_input("屋内風速 [m/s]", value=float(p
 preset["train_v"] = st.sidebar.number_input("電車風速 [m/s]", value=float(preset["train_v"]), step=0.05, format="%.2f")
 preset["car_v"] = st.sidebar.number_input("車風速 [m/s]", value=float(preset["car_v"]), step=0.05, format="%.2f")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "① 主要移動の入力",
     "② 地点マスタ",
     "③ 推定結果",
     "④ 研究者向け可視化",
     "⑤ クローゼット登録",
+    "⑥ 提案手法評価",
 ])
 
 with tab1:
@@ -772,3 +870,237 @@ with tab5:
                     if st.button("削除", key=f"delete_closet_item_{i}", use_container_width=True):
                         st.session_state.closet_items = delete_closet_item(st.session_state.closet_items, i)
                         st.rerun()
+
+
+with tab6:
+    st.subheader("提案手法評価")
+    st.caption("従来手法は PMV入力温度を Tenv、提案手法は PMV入力温度を Teff として比較します。")
+
+    missing_message = "評価に必要なデータが不足しています。予定入力・環境温度取得・温熱状態推定を先に実行してください。"
+    required_eval_cols = {"estimated_temp", "teff", "delta_t", "delta_t_elapsed_clipped_min", "rh", "v", "met"}
+
+    if trip_df.empty or errors or not result_ready or minute_df is None or minute_df.empty:
+        st.warning(missing_message)
+        if errors:
+            for err in errors:
+                st.error(err)
+    elif not required_eval_cols.issubset(set(minute_df.columns)):
+        st.warning(missing_message)
+    else:
+        eval_clo_min, eval_clo_max, eval_clo_step = st.columns(3)
+        with eval_clo_min:
+            clo_min_eval = st.number_input("CLO探索下限", value=0.10, min_value=0.0, max_value=5.0, step=0.01, format="%.2f")
+        with eval_clo_max:
+            clo_max_eval = st.number_input("CLO探索上限", value=2.00, min_value=0.1, max_value=5.0, step=0.01, format="%.2f")
+        with eval_clo_step:
+            clo_step_eval = st.number_input("CLO探索刻み", value=0.01, min_value=0.01, max_value=0.50, step=0.01, format="%.2f")
+
+        fixed_clo = st.number_input(
+            "PMV推移比較で固定するCLO",
+            value=float(adjusted_clo),
+            min_value=0.0,
+            max_value=5.0,
+            step=0.01,
+            format="%.2f",
+        )
+
+        try:
+            recommendation_comparison = compare_clo_recommendation(
+                minute_df,
+                clo_min=clo_min_eval,
+                clo_max=clo_max_eval,
+                clo_step=clo_step_eval,
+            )
+
+            st.markdown("### 1. 推奨CLO比較")
+            rec_df = pd.DataFrame([
+                {
+                    "手法": "従来手法",
+                    "入力温度": "Tenv",
+                    "推奨CLO": recommendation_comparison["conventional"]["best_clo"],
+                    "最終PMV": recommendation_comparison["conventional"]["best_pmv"],
+                    "誤差": recommendation_comparison["conventional"]["best_error"],
+                },
+                {
+                    "手法": "提案手法",
+                    "入力温度": "Teff",
+                    "推奨CLO": recommendation_comparison["proposed"]["best_clo"],
+                    "最終PMV": recommendation_comparison["proposed"]["best_pmv"],
+                    "誤差": recommendation_comparison["proposed"]["best_error"],
+                },
+            ])
+            st.dataframe(rec_df, use_container_width=True, hide_index=True)
+
+            for method_key, method_name in [("conventional", "従来手法"), ("proposed", "提案手法")]:
+                warnings = recommendation_comparison[method_key].get("warnings", [])
+                for warning in warnings:
+                    st.warning(f"{method_name}: {warning}")
+
+            debug_df = pd.DataFrame([
+                {
+                    "手法": "従来手法",
+                    "入力温度": "Tenv",
+                    "入力温度最小": recommendation_comparison["conventional"]["debug"]["temperature_min"],
+                    "入力温度最大": recommendation_comparison["conventional"]["debug"]["temperature_max"],
+                    "湿度": recommendation_comparison["conventional"]["debug"]["humidity"],
+                    "風速": recommendation_comparison["conventional"]["debug"]["air_speed"],
+                    "代謝量": recommendation_comparison["conventional"]["debug"]["met"],
+                    "探索された推奨CLO": recommendation_comparison["conventional"]["debug"]["best_clo"],
+                    "最終PMV": recommendation_comparison["conventional"]["debug"]["best_pmv"],
+                },
+                {
+                    "手法": "提案手法",
+                    "入力温度": "Teff",
+                    "入力温度最小": recommendation_comparison["proposed"]["debug"]["temperature_min"],
+                    "入力温度最大": recommendation_comparison["proposed"]["debug"]["temperature_max"],
+                    "湿度": recommendation_comparison["proposed"]["debug"]["humidity"],
+                    "風速": recommendation_comparison["proposed"]["debug"]["air_speed"],
+                    "代謝量": recommendation_comparison["proposed"]["debug"]["met"],
+                    "探索された推奨CLO": recommendation_comparison["proposed"]["debug"]["best_clo"],
+                    "最終PMV": recommendation_comparison["proposed"]["debug"]["best_pmv"],
+                },
+            ])
+            for warning in _evaluation_debug_anomalies(minute_df, recommendation_comparison, clo_min_eval, clo_max_eval):
+                st.warning(warning)
+
+            with st.expander("Teff計算デバッグ情報"):
+                teff_debug_df = minute_df.copy()
+                teff_debug_df["Ttarget"] = pd.to_numeric(teff_debug_df["estimated_temp"], errors="coerce") + pd.to_numeric(teff_debug_df["delta_t"], errors="coerce")
+                teff_summary_df = pd.DataFrame([
+                    {"項目": "α", "値": float(alpha)},
+                    {"項目": "Δt", "値": 1.0},
+                    {"項目": "ΔT式のt上限[min]", "値": float(DELTA_T_MAX_MINUTES)},
+                    {"項目": "初期Teff", "値": float(teff_debug_df["teff"].iloc[0])},
+                    {"項目": "使用しているΔT式", "値": str(DELTA_T_COEFFS)},
+                    {"項目": "使用している遷移方向", "値": "、".join([str(v) for v in teff_debug_df["transition_direction"].dropna().unique()])},
+                    {"項目": "使用している温度差区分", "値": "in_to_out / out_to_in"},
+                    {"項目": "Tenv 最小値", "値": float(teff_debug_df["estimated_temp"].min())},
+                    {"項目": "Tenv 最大値", "値": float(teff_debug_df["estimated_temp"].max())},
+                    {"項目": "ΔT 最小値", "値": float(teff_debug_df["delta_t"].min())},
+                    {"項目": "ΔT 最大値", "値": float(teff_debug_df["delta_t"].max())},
+                    {"項目": "Ttarget 最小値", "値": float(teff_debug_df["Ttarget"].min())},
+                    {"項目": "Ttarget 最大値", "値": float(teff_debug_df["Ttarget"].max())},
+                    {"項目": "Teff 最小値", "値": float(teff_debug_df["teff"].min())},
+                    {"項目": "Teff 最大値", "値": float(teff_debug_df["teff"].max())},
+                ])
+                st.dataframe(teff_summary_df, use_container_width=True, hide_index=True)
+                st.line_chart(teff_debug_df[["datetime", "estimated_temp", "delta_t", "Ttarget", "teff"]].set_index("datetime"))
+                st.dataframe(
+                    teff_debug_df[[
+                        "datetime", "estimated_temp", "delta_t", "Ttarget", "teff",
+                        "transition_direction", "transition_elapsed_min", "delta_t_elapsed_clipped_min"
+                    ]].head(300),
+                    use_container_width=True,
+                )
+                st.markdown("#### Teff計算ステップ確認（先頭10行）")
+                st.dataframe(_build_teff_step_debug_df(minute_df, alpha), use_container_width=True, hide_index=True)
+
+            with st.expander("PMV計算デバッグ情報"):
+                conventional_pmv_debug_df, _ = calculate_pmv_series(
+                    minute_df,
+                    clo=recommendation_comparison["conventional"]["best_clo"],
+                    use_teff_for_tdb=False,
+                    use_teff_for_tr=False,
+                )
+                proposed_pmv_debug_df, _ = calculate_pmv_series(
+                    minute_df,
+                    clo=recommendation_comparison["proposed"]["best_clo"],
+                    use_teff_for_tdb=True,
+                    use_teff_for_tr=True,
+                )
+                pmv_debug_df = pd.concat([
+                    _build_pmv_input_debug_df(
+                        minute_df,
+                        conventional_pmv_debug_df,
+                        "従来手法",
+                        "estimated_temp",
+                        recommendation_comparison["conventional"]["best_clo"],
+                    ),
+                    _build_pmv_input_debug_df(
+                        minute_df,
+                        proposed_pmv_debug_df,
+                        "提案手法",
+                        "teff",
+                        recommendation_comparison["proposed"]["best_clo"],
+                    ),
+                ], ignore_index=True)
+                st.dataframe(pmv_debug_df, use_container_width=True, hide_index=True)
+
+            with st.expander("CLO探索デバッグ情報", expanded=True):
+                st.dataframe(debug_df, use_container_width=True, hide_index=True)
+                st.markdown("#### 探索条件")
+                st.json({
+                    "clo_min": clo_min_eval,
+                    "clo_max": clo_max_eval,
+                    "clo_step": clo_step_eval,
+                    "target_pmv": 0.0,
+                    "従来手法_best_clo": recommendation_comparison["conventional"]["best_clo"],
+                    "従来手法_best_pmv": recommendation_comparison["conventional"]["best_pmv"],
+                    "従来手法_best_error": recommendation_comparison["conventional"]["best_error"],
+                    "提案手法_best_clo": recommendation_comparison["proposed"]["best_clo"],
+                    "提案手法_best_pmv": recommendation_comparison["proposed"]["best_pmv"],
+                    "提案手法_best_error": recommendation_comparison["proposed"]["best_error"],
+                })
+                st.markdown("#### 従来手法 探索結果")
+                st.dataframe(_summarize_search_results(recommendation_comparison["conventional"]["search_results"]), use_container_width=True, hide_index=True)
+                st.markdown("#### 提案手法 探索結果")
+                st.dataframe(_summarize_search_results(recommendation_comparison["proposed"]["search_results"]), use_container_width=True, hide_index=True)
+
+            d1, d2 = st.columns(2)
+            d1.metric("CLO差分（提案 - 従来）", f"{recommendation_comparison['clo_diff']:+.2f}")
+            d2.metric("厚着を推薦した手法", recommendation_comparison["heavier_method"])
+
+            if recommendation_comparison["heavier_method"] == "同程度":
+                st.info("従来手法と提案手法で推奨CLOは同程度でした。今回の予定条件では、温熱状態の時間遅れが推奨CLOに与える影響は小さいと考えられます。")
+            else:
+                st.info(
+                    f"環境遷移を考慮した結果、{recommendation_comparison['heavier_method']}の方が厚い服装を推薦しました。"
+                    f"CLO差分は {recommendation_comparison['clo_diff']:+.2f} clo です。"
+                )
+
+            st.markdown("### 2. PMV推移比較")
+            transition_df, transition_metrics = compare_pmv_transition(
+                minute_df,
+                fixed_clo=fixed_clo,
+                comfort_lower=-0.5,
+                comfort_upper=0.5,
+            )
+
+            plot_df = transition_df[["datetime", "pmv_conventional", "pmv_proposed"]].set_index("datetime")
+            plot_df = plot_df.rename(columns={
+                "pmv_conventional": "従来手法PMV（Tenv）",
+                "pmv_proposed": "提案手法PMV（Teff）",
+            })
+            st.line_chart(plot_df)
+
+            diff_plot_df = transition_df[["datetime", "pmv_diff"]].set_index("datetime").rename(columns={
+                "pmv_diff": "PMV差分（提案 - 従来）"
+            })
+            st.line_chart(diff_plot_df)
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("平均PMV差", f"{transition_metrics['mean_pmv_diff']:+.3f}")
+            m2.metric("最大PMV差", f"{transition_metrics['max_abs_pmv_diff']:.3f}")
+            m3.metric("快適範囲内割合（従来）", f"{transition_metrics['conventional_comfort_ratio']:.1f} %")
+            m4.metric("快適範囲内割合（提案）", f"{transition_metrics['proposed_comfort_ratio']:.1f} %")
+
+            st.markdown("### 自動考察")
+            st.write(
+                "・同じCLO値を着用した場合でも、提案手法では一次遅れモデルにより、環境遷移直後のPMV変化が従来手法と異なる可能性があります。"
+            )
+            st.write(
+                f"・平均PMV差は {transition_metrics['mean_pmv_diff']:+.3f}、最大PMV差は {transition_metrics['max_abs_pmv_diff']:.3f} でした。"
+            )
+            st.write(
+                "・これは、PMVへ入力する温度を環境温度そのものではなく、人体温熱状態の時間遅れを反映した Teff に変更したためと考えられます。"
+            )
+
+            with st.expander("比較データを確認する"):
+                display_eval_cols = [
+                    "datetime", "estimated_temp", "teff", "rh", "v", "met",
+                    "pmv_conventional", "pmv_proposed", "pmv_diff"
+                ]
+                st.dataframe(transition_df[display_eval_cols].head(500), use_container_width=True)
+        except Exception as exc:
+            st.warning(missing_message)
+            st.error(str(exc))

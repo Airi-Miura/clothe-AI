@@ -188,13 +188,19 @@ DELTA_T_COEFFS = {
     "in_to_out": {"a": -0.185750, "b": 7.741123},
     "out_to_in": {"a": 0.212578, "b": -0.925903},
 }
+DELTA_T_MAX_MINUTES = 10.0
+
+
+def clip_delta_t_elapsed(elapsed_min: float) -> float:
+    return min(max(float(elapsed_min), 0.0), float(DELTA_T_MAX_MINUTES))
 
 
 def calculate_delta_t(elapsed_min: float, transition_direction: Optional[str]) -> float:
     if transition_direction not in DELTA_T_COEFFS:
         return 0.0
     coef = DELTA_T_COEFFS[transition_direction]
-    return float(coef["a"]) * float(elapsed_min) + float(coef["b"])
+    elapsed_clipped = clip_delta_t_elapsed(elapsed_min)
+    return float(coef["a"]) * elapsed_clipped + float(coef["b"])
 
 
 def _is_outdoor_env(environment: str) -> bool:
@@ -771,11 +777,13 @@ def apply_first_order_lag_to_minutes(minute_df: pd.DataFrame, alpha: float, dt_m
         df["delta_t"] = []
         df["transition_direction"] = []
         df["transition_elapsed_min"] = []
+        df["delta_t_elapsed_clipped_min"] = []
         return df
 
     n = len(df)
     transition_direction = [None] * n
     transition_elapsed_min = [0.0] * n
+    delta_t_elapsed_clipped_min = [0.0] * n
     delta_t_values = [0.0] * n
 
     current_direction: Optional[str] = None
@@ -783,14 +791,18 @@ def apply_first_order_lag_to_minutes(minute_df: pd.DataFrame, alpha: float, dt_m
 
     for i in range(n):
         if i > 0:
-            prev_outdoor = _is_outdoor_env(df.loc[i - 1, "environment"])
-            cur_outdoor = _is_outdoor_env(df.loc[i, "environment"])
-            if not prev_outdoor and cur_outdoor:
-                current_direction = "in_to_out"
+            prev_environment = df.loc[i - 1, "environment"]
+            cur_environment = df.loc[i, "environment"]
+            if prev_environment != cur_environment:
+                prev_outdoor = _is_outdoor_env(prev_environment)
+                cur_outdoor = _is_outdoor_env(cur_environment)
                 transition_start_dt = df.loc[i, "datetime"]
-            elif prev_outdoor and not cur_outdoor:
-                current_direction = "out_to_in"
-                transition_start_dt = df.loc[i, "datetime"]
+                if not prev_outdoor and cur_outdoor:
+                    current_direction = "in_to_out"
+                elif prev_outdoor and not cur_outdoor:
+                    current_direction = "out_to_in"
+                else:
+                    current_direction = None
 
         if current_direction is not None and transition_start_dt is not None:
             elapsed = (df.loc[i, "datetime"] - transition_start_dt).total_seconds() / 60.0
@@ -801,6 +813,7 @@ def apply_first_order_lag_to_minutes(minute_df: pd.DataFrame, alpha: float, dt_m
 
         transition_direction[i] = current_direction
         transition_elapsed_min[i] = elapsed
+        delta_t_elapsed_clipped_min[i] = clip_delta_t_elapsed(elapsed)
         delta_t_values[i] = calculate_delta_t(elapsed, current_direction)
 
     teff_values = [float(df.loc[0, "estimated_temp"])]
@@ -815,6 +828,7 @@ def apply_first_order_lag_to_minutes(minute_df: pd.DataFrame, alpha: float, dt_m
     df["delta_t"] = [round(float(v), 4) for v in delta_t_values]
     df["transition_direction"] = transition_direction
     df["transition_elapsed_min"] = [round(float(v), 2) for v in transition_elapsed_min]
+    df["delta_t_elapsed_clipped_min"] = [round(float(v), 2) for v in delta_t_elapsed_clipped_min]
     return df
 
 
@@ -928,3 +942,212 @@ def aggregate_minutes_to_segments(minute_df: pd.DataFrame) -> pd.DataFrame:
         rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+def _validate_evaluation_minute_df(minute_df: pd.DataFrame) -> list[str]:
+    required_cols = ["estimated_temp", "teff", "rh", "v", "met"]
+    if minute_df is None or minute_df.empty:
+        return ["minute_df is empty"]
+    missing = [col for col in required_cols if col not in minute_df.columns]
+    if missing:
+        return missing
+    return []
+
+
+def _temperature_mode_to_flags(temperature_mode: str) -> tuple[bool, bool]:
+    if temperature_mode == "teff":
+        return True, True
+    return False, False
+
+
+def _series_range_label(series: pd.Series, digits: int = 3):
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return None
+    min_value = round(float(values.min()), digits)
+    max_value = round(float(values.max()), digits)
+    if min_value == max_value:
+        return min_value
+    return f"{min_value}〜{max_value}"
+
+
+def _build_clo_search_debug(minute_df: pd.DataFrame, temperature_mode: str, best: dict) -> dict:
+    temp_col = "teff" if temperature_mode == "teff" else "estimated_temp"
+    return {
+        "temperature_min": round(float(pd.to_numeric(minute_df[temp_col], errors="coerce").min()), 3),
+        "temperature_max": round(float(pd.to_numeric(minute_df[temp_col], errors="coerce").max()), 3),
+        "humidity": _series_range_label(minute_df["rh"]),
+        "air_speed": _series_range_label(minute_df["v"]),
+        "met": _series_range_label(minute_df["met"]),
+        "best_clo": best["best_clo"],
+        "best_pmv": best["best_pmv"],
+    }
+
+
+def find_clo_for_target_pmv(
+    minute_df: pd.DataFrame,
+    temperature_mode: str,
+    target_pmv: float = 0.0,
+    clo_min: float = 0.10,
+    clo_max: float = 2.00,
+    clo_step: float = 0.01,
+) -> dict:
+    errors = _validate_evaluation_minute_df(minute_df)
+    if errors:
+        raise ValueError("評価に必要な列が不足しています: " + ", ".join(errors))
+    if clo_step <= 0:
+        raise ValueError("CLO探索刻みは0より大きい値にしてください。")
+    if clo_min > clo_max:
+        raise ValueError("CLO探索下限は上限以下にしてください。")
+
+    use_teff_for_tdb, use_teff_for_tr = _temperature_mode_to_flags(temperature_mode)
+    best = None
+    skipped_count = 0
+    search_results = []
+    n_steps = int(round((float(clo_max) - float(clo_min)) / float(clo_step))) + 1
+
+    for i in range(n_steps):
+        clo_value = round(float(clo_min) + i * float(clo_step), 2)
+        try:
+            pmv_df, pmv_available = calculate_pmv_series(
+                minute_df,
+                clo=clo_value,
+                use_teff_for_tdb=use_teff_for_tdb,
+                use_teff_for_tr=use_teff_for_tr,
+            )
+            if not pmv_available or "pmv" not in pmv_df.columns or not pmv_df["pmv"].notna().any():
+                skipped_count += 1
+                search_results.append({"clo": clo_value, "pmv": None, "error": None, "status": "pmv_unavailable"})
+                continue
+
+            pmv_values = pd.to_numeric(pmv_df["pmv"], errors="coerce").dropna()
+            if pmv_values.empty:
+                skipped_count += 1
+                search_results.append({"clo": clo_value, "pmv": None, "error": None, "status": "pmv_empty"})
+                continue
+
+            representative_pmv = float(pmv_values.iloc[-1])
+            error = abs(representative_pmv - float(target_pmv))
+            search_results.append({
+                "clo": clo_value,
+                "pmv": round(representative_pmv, 3),
+                "error": round(float(error), 3),
+                "status": "ok",
+            })
+        except Exception as exc:
+            skipped_count += 1
+            search_results.append({"clo": clo_value, "pmv": None, "error": None, "status": f"error: {exc}"})
+            continue
+
+        if best is None or error < best["best_error"]:
+            best = {
+                "best_clo": clo_value,
+                "best_pmv": round(representative_pmv, 3),
+                "best_error": round(float(error), 3),
+                "raw_error": float(error),
+            }
+
+    if best is None:
+        raise RuntimeError("CLO探索で有効なPMVを計算できませんでした。pythermalcomfort と入力条件を確認してください。")
+
+    warnings = []
+    if abs(float(best["best_clo"]) - float(clo_min)) < 1e-9:
+        warnings.append(f"推奨CLOが探索下限 {clo_min:.2f} clo に達しています。探索範囲を確認してください。")
+    if abs(float(best["best_clo"]) - float(clo_max)) < 1e-9:
+        warnings.append(f"推奨CLOが探索上限 {clo_max:.2f} clo に達しています。探索範囲を確認してください。")
+    if abs(float(best["best_pmv"])) > 3.0:
+        warnings.append(f"最終PMVが -3〜3 の範囲を大きく超えています（PMV={best['best_pmv']:.3f}）。入力条件と探索範囲を確認してください。")
+    if skipped_count:
+        warnings.append(f"PMV計算に失敗したCLO候補を {skipped_count} 件スキップしました。")
+
+    best["search_results"] = search_results
+    best["warning"] = " ".join(warnings)
+    best["warnings"] = warnings
+    best["debug"] = _build_clo_search_debug(minute_df, temperature_mode, best)
+
+    # Backward-compatible aliases used by the existing evaluation UI.
+    best["clo"] = best["best_clo"]
+    best["pmv"] = best["best_pmv"]
+    best["score"] = best["best_error"]
+    return best
+
+
+def compare_clo_recommendation(
+    minute_df: pd.DataFrame,
+    clo_min: float = 0.10,
+    clo_max: float = 2.00,
+    clo_step: float = 0.01,
+) -> dict:
+    conventional = find_clo_for_target_pmv(
+        minute_df,
+        temperature_mode="tenv",
+        clo_min=clo_min,
+        clo_max=clo_max,
+        clo_step=clo_step,
+    )
+    proposed = find_clo_for_target_pmv(
+        minute_df,
+        temperature_mode="teff",
+        clo_min=clo_min,
+        clo_max=clo_max,
+        clo_step=clo_step,
+    )
+    diff = round(float(proposed["best_clo"]) - float(conventional["best_clo"]), 2)
+    if diff > 0:
+        heavier = "提案手法"
+    elif diff < 0:
+        heavier = "従来手法"
+    else:
+        heavier = "同程度"
+
+    return {
+        "conventional": conventional,
+        "proposed": proposed,
+        "clo_diff": diff,
+        "heavier_method": heavier,
+    }
+
+
+def compare_pmv_transition(
+    minute_df: pd.DataFrame,
+    fixed_clo: float,
+    comfort_lower: float = -0.5,
+    comfort_upper: float = 0.5,
+) -> tuple[pd.DataFrame, dict]:
+    errors = _validate_evaluation_minute_df(minute_df)
+    if errors:
+        raise ValueError("評価に必要な列が不足しています: " + ", ".join(errors))
+
+    conventional_df, conventional_available = calculate_pmv_series(
+        minute_df,
+        clo=fixed_clo,
+        use_teff_for_tdb=False,
+        use_teff_for_tr=False,
+    )
+    proposed_df, proposed_available = calculate_pmv_series(
+        minute_df,
+        clo=fixed_clo,
+        use_teff_for_tdb=True,
+        use_teff_for_tr=True,
+    )
+    if not conventional_available or not proposed_available:
+        raise RuntimeError("PMVを計算できませんでした。pythermalcomfort の導入を確認してください。")
+
+    result_df = minute_df.copy()
+    result_df["pmv_conventional"] = conventional_df["pmv"]
+    result_df["pmv_proposed"] = proposed_df["pmv"]
+    result_df["pmv_diff"] = result_df["pmv_proposed"] - result_df["pmv_conventional"]
+
+    valid = result_df.dropna(subset=["pmv_conventional", "pmv_proposed"]).copy()
+    if valid.empty:
+        raise RuntimeError("PMV推移比較に使えるPMV値がありません。")
+
+    conventional_comfort = valid["pmv_conventional"].between(comfort_lower, comfort_upper).mean() * 100
+    proposed_comfort = valid["pmv_proposed"].between(comfort_lower, comfort_upper).mean() * 100
+    metrics = {
+        "mean_pmv_diff": round(float(valid["pmv_diff"].mean()), 3),
+        "max_abs_pmv_diff": round(float(valid["pmv_diff"].abs().max()), 3),
+        "conventional_comfort_ratio": round(float(conventional_comfort), 1),
+        "proposed_comfort_ratio": round(float(proposed_comfort), 1),
+    }
+    return result_df, metrics
