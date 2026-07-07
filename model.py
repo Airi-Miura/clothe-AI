@@ -184,9 +184,20 @@ def get_recommendation_message(offset: float) -> str:
     return "標準的な体感として服装を推薦します。"
 
 
+# ΔT式は代表温度差ごとに管理し、将来1〜15℃などを追加しやすい形にする。
 DELTA_T_COEFFS = {
-    "in_to_out": {"a": -0.185750, "b": 7.741123},
-    "out_to_in": {"a": 0.212578, "b": -0.925903},
+    3.0: {
+        "up": {"a": -0.1858, "b": 7.7411},
+        "down": {"a": 0.2126, "b": -0.9259},
+    },
+    5.0: {
+        "up": {"a": 0.244412, "b": 1.079412},
+        "down": {"a": -0.060000, "b": 9.146667},
+    },
+    7.0: {
+        "up": {"a": 0.049862, "b": 1.061509},
+        "down": {"a": -0.085495, "b": 8.734286},
+    },
 }
 DELTA_T_MAX_MINUTES = 10.0
 
@@ -195,12 +206,56 @@ def clip_delta_t_elapsed(elapsed_min: float) -> float:
     return min(max(float(elapsed_min), 0.0), float(DELTA_T_MAX_MINUTES))
 
 
-def calculate_delta_t(elapsed_min: float, transition_direction: Optional[str]) -> float:
-    if transition_direction not in DELTA_T_COEFFS:
+def judge_delta_t_direction(prev_temp: float, current_temp: float) -> Optional[str]:
+    # 温度変化の向きをPMV評価用のΔT式選択に使う。
+    if pd.isna(prev_temp) or pd.isna(current_temp):
+        return None
+    if float(current_temp) > float(prev_temp):
+        return "up"
+    if float(current_temp) < float(prev_temp):
+        return "down"
+    return None
+
+
+def select_delta_t_params(temp_diff: float, direction: Optional[str]) -> dict:
+    # 実測の温度差に最も近い代表温度差（3℃/5℃/7℃）の式を選ぶ。
+    if direction not in {"up", "down"}:
+        return {"a": 0.0, "b": 0.0, "selected_temp_diff": None, "formula": "ΔT(t)=0"}
+    if pd.isna(temp_diff):
+        return {"a": 0.0, "b": 0.0, "selected_temp_diff": None, "formula": "ΔT(t)=0"}
+
+    diff_value = abs(float(temp_diff))
+    selected_temp_diff = min(DELTA_T_COEFFS.keys(), key=lambda key: abs(float(key) - diff_value))
+    coef = DELTA_T_COEFFS[selected_temp_diff][direction]
+    a = float(coef["a"])
+    b = float(coef["b"])
+    return {
+        "a": a,
+        "b": b,
+        "selected_temp_diff": float(selected_temp_diff),
+        "formula": f"ΔT(t)={a:.6f}t{b:+.6f}",
+    }
+
+
+def calculate_delta_t(
+    elapsed_min: float,
+    transition_direction: Optional[str] = None,
+    temp_diff: Optional[float] = None,
+    prev_temp: Optional[float] = None,
+    current_temp: Optional[float] = None,
+) -> float:
+    # tは環境遷移後の経過時間を使い、10分以降はΔT(10)で一定にする。
+    direction = transition_direction
+    diff_value = temp_diff
+    if prev_temp is not None and current_temp is not None:
+        direction = judge_delta_t_direction(prev_temp, current_temp)
+        diff_value = abs(float(current_temp) - float(prev_temp))
+    if diff_value is None:
         return 0.0
-    coef = DELTA_T_COEFFS[transition_direction]
+
+    params = select_delta_t_params(diff_value, direction)
     elapsed_clipped = clip_delta_t_elapsed(elapsed_min)
-    return float(coef["a"]) * elapsed_clipped + float(coef["b"])
+    return float(params["a"]) * elapsed_clipped + float(params["b"])
 
 
 def _is_outdoor_env(environment: str) -> bool:
@@ -776,17 +831,26 @@ def apply_first_order_lag_to_minutes(minute_df: pd.DataFrame, alpha: float, dt_m
         df["teff"] = []
         df["delta_t"] = []
         df["transition_direction"] = []
+        df["transition_temp_diff"] = []
+        df["delta_t_selected_temp_diff"] = []
+        df["delta_t_formula"] = []
         df["transition_elapsed_min"] = []
         df["delta_t_elapsed_clipped_min"] = []
         return df
 
     n = len(df)
     transition_direction = [None] * n
+    transition_temp_diff = [0.0] * n
+    delta_t_selected_temp_diff = [None] * n
+    delta_t_formula = ["ΔT(t)=0"] * n
     transition_elapsed_min = [0.0] * n
     delta_t_elapsed_clipped_min = [0.0] * n
     delta_t_values = [0.0] * n
 
     current_direction: Optional[str] = None
+    current_temp_diff = 0.0
+    current_selected_temp_diff = None
+    current_formula = "ΔT(t)=0"
     transition_start_dt = None
 
     for i in range(n):
@@ -794,15 +858,14 @@ def apply_first_order_lag_to_minutes(minute_df: pd.DataFrame, alpha: float, dt_m
             prev_environment = df.loc[i - 1, "environment"]
             cur_environment = df.loc[i, "environment"]
             if prev_environment != cur_environment:
-                prev_outdoor = _is_outdoor_env(prev_environment)
-                cur_outdoor = _is_outdoor_env(cur_environment)
                 transition_start_dt = df.loc[i, "datetime"]
-                if not prev_outdoor and cur_outdoor:
-                    current_direction = "in_to_out"
-                elif prev_outdoor and not cur_outdoor:
-                    current_direction = "out_to_in"
-                else:
-                    current_direction = None
+                prev_temp = float(df.loc[i - 1, "estimated_temp"])
+                current_temp = float(df.loc[i, "estimated_temp"])
+                current_direction = judge_delta_t_direction(prev_temp, current_temp)
+                current_temp_diff = abs(current_temp - prev_temp)
+                selected = select_delta_t_params(current_temp_diff, current_direction)
+                current_selected_temp_diff = selected["selected_temp_diff"]
+                current_formula = selected["formula"]
 
         if current_direction is not None and transition_start_dt is not None:
             elapsed = (df.loc[i, "datetime"] - transition_start_dt).total_seconds() / 60.0
@@ -812,9 +875,12 @@ def apply_first_order_lag_to_minutes(minute_df: pd.DataFrame, alpha: float, dt_m
             elapsed = 0.0
 
         transition_direction[i] = current_direction
+        transition_temp_diff[i] = current_temp_diff if current_direction is not None else 0.0
+        delta_t_selected_temp_diff[i] = current_selected_temp_diff
+        delta_t_formula[i] = current_formula if current_direction is not None else "ΔT(t)=0"
         transition_elapsed_min[i] = elapsed
         delta_t_elapsed_clipped_min[i] = clip_delta_t_elapsed(elapsed)
-        delta_t_values[i] = calculate_delta_t(elapsed, current_direction)
+        delta_t_values[i] = calculate_delta_t(elapsed, current_direction, current_temp_diff)
 
     teff_values = [float(df.loc[0, "estimated_temp"])]
     for i in range(1, n):
@@ -827,6 +893,9 @@ def apply_first_order_lag_to_minutes(minute_df: pd.DataFrame, alpha: float, dt_m
     df["teff"] = [round(float(v), 3) for v in teff_values]
     df["delta_t"] = [round(float(v), 4) for v in delta_t_values]
     df["transition_direction"] = transition_direction
+    df["transition_temp_diff"] = [round(float(v), 3) for v in transition_temp_diff]
+    df["delta_t_selected_temp_diff"] = delta_t_selected_temp_diff
+    df["delta_t_formula"] = delta_t_formula
     df["transition_elapsed_min"] = [round(float(v), 2) for v in transition_elapsed_min]
     df["delta_t_elapsed_clipped_min"] = [round(float(v), 2) for v in delta_t_elapsed_clipped_min]
     return df

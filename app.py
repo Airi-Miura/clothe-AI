@@ -304,7 +304,10 @@ def _build_teff_step_debug_df(minute_df: pd.DataFrame, alpha_value: float, dt_mi
             "α": float(alpha_value),
             "Δt": float(dt_min),
             "Teff_after": teff_after,
+            "温度差": minute_df["transition_temp_diff"].iloc[i] if "transition_temp_diff" in minute_df.columns else None,
             "遷移方向": minute_df["transition_direction"].iloc[i] if "transition_direction" in minute_df.columns else None,
+            "代表温度差": minute_df["delta_t_selected_temp_diff"].iloc[i] if "delta_t_selected_temp_diff" in minute_df.columns else None,
+            "使用ΔT式": minute_df["delta_t_formula"].iloc[i] if "delta_t_formula" in minute_df.columns else None,
             "t_since_transition": minute_df["transition_elapsed_min"].iloc[i] if "transition_elapsed_min" in minute_df.columns else None,
             "t_clip": minute_df["delta_t_elapsed_clipped_min"].iloc[i] if "delta_t_elapsed_clipped_min" in minute_df.columns else None,
         })
@@ -895,15 +898,6 @@ with tab6:
         with eval_clo_step:
             clo_step_eval = st.number_input("CLO探索刻み", value=0.01, min_value=0.01, max_value=0.50, step=0.01, format="%.2f")
 
-        fixed_clo = st.number_input(
-            "PMV推移比較で固定するCLO",
-            value=float(adjusted_clo),
-            min_value=0.0,
-            max_value=5.0,
-            step=0.01,
-            format="%.2f",
-        )
-
         try:
             recommendation_comparison = compare_clo_recommendation(
                 minute_df,
@@ -911,6 +905,7 @@ with tab6:
                 clo_max=clo_max_eval,
                 clo_step=clo_step_eval,
             )
+            clo_base = float(recommendation_comparison["proposed"]["best_clo"])
 
             st.markdown("### 1. 推奨CLO比較")
             rec_df = pd.DataFrame([
@@ -971,9 +966,9 @@ with tab6:
                     {"項目": "Δt", "値": 1.0},
                     {"項目": "ΔT式のt上限[min]", "値": float(DELTA_T_MAX_MINUTES)},
                     {"項目": "初期Teff", "値": float(teff_debug_df["teff"].iloc[0])},
-                    {"項目": "使用しているΔT式", "値": str(DELTA_T_COEFFS)},
+                    {"項目": "使用可能なΔT式", "値": str(DELTA_T_COEFFS)},
                     {"項目": "使用している遷移方向", "値": "、".join([str(v) for v in teff_debug_df["transition_direction"].dropna().unique()])},
-                    {"項目": "使用している温度差区分", "値": "in_to_out / out_to_in"},
+                    {"項目": "使用している代表温度差", "値": "、".join([str(v) for v in teff_debug_df["delta_t_selected_temp_diff"].dropna().unique()]) if "delta_t_selected_temp_diff" in teff_debug_df.columns else ""},
                     {"項目": "Tenv 最小値", "値": float(teff_debug_df["estimated_temp"].min())},
                     {"項目": "Tenv 最大値", "値": float(teff_debug_df["estimated_temp"].max())},
                     {"項目": "ΔT 最小値", "値": float(teff_debug_df["delta_t"].min())},
@@ -985,11 +980,15 @@ with tab6:
                 ])
                 st.dataframe(teff_summary_df, use_container_width=True, hide_index=True)
                 st.line_chart(teff_debug_df[["datetime", "estimated_temp", "delta_t", "Ttarget", "teff"]].set_index("datetime"))
+                # ΔT式確認用の列は、古いセッションデータが残っている場合に備えて存在する列だけ表示する。
+                teff_debug_cols = [
+                    "datetime", "estimated_temp", "delta_t", "Ttarget", "teff",
+                    "transition_temp_diff", "transition_direction", "delta_t_selected_temp_diff",
+                    "delta_t_formula", "transition_elapsed_min", "delta_t_elapsed_clipped_min"
+                ]
+                teff_debug_cols = [col for col in teff_debug_cols if col in teff_debug_df.columns]
                 st.dataframe(
-                    teff_debug_df[[
-                        "datetime", "estimated_temp", "delta_t", "Ttarget", "teff",
-                        "transition_direction", "transition_elapsed_min", "delta_t_elapsed_clipped_min"
-                    ]].head(300),
+                    teff_debug_df[teff_debug_cols].head(300),
                     use_container_width=True,
                 )
                 st.markdown("#### Teff計算ステップ確認（先頭10行）")
@@ -998,13 +997,13 @@ with tab6:
             with st.expander("PMV計算デバッグ情報"):
                 conventional_pmv_debug_df, _ = calculate_pmv_series(
                     minute_df,
-                    clo=recommendation_comparison["conventional"]["best_clo"],
+                    clo=clo_base,
                     use_teff_for_tdb=False,
                     use_teff_for_tr=False,
                 )
                 proposed_pmv_debug_df, _ = calculate_pmv_series(
                     minute_df,
-                    clo=recommendation_comparison["proposed"]["best_clo"],
+                    clo=clo_base,
                     use_teff_for_tdb=True,
                     use_teff_for_tr=True,
                 )
@@ -1014,14 +1013,14 @@ with tab6:
                         conventional_pmv_debug_df,
                         "従来手法",
                         "estimated_temp",
-                        recommendation_comparison["conventional"]["best_clo"],
+                        clo_base,
                     ),
                     _build_pmv_input_debug_df(
                         minute_df,
                         proposed_pmv_debug_df,
                         "提案手法",
                         "teff",
-                        recommendation_comparison["proposed"]["best_clo"],
+                        clo_base,
                     ),
                 ], ignore_index=True)
                 st.dataframe(pmv_debug_df, use_container_width=True, hide_index=True)
@@ -1058,13 +1057,33 @@ with tab6:
                     f"CLO差分は {recommendation_comparison['clo_diff']:+.2f} clo です。"
                 )
 
-            st.markdown("### 2. PMV推移比較")
+            st.markdown("### 2. PMV判定誤差")
+            st.caption("評価条件: 提案手法で推薦されたCLO値を共通に使用し、入力温度のみを Tenv / Teff で変更します。")
+            st.metric("評価に使用したCLO値（CLO_base）", f"{clo_base:.2f}")
             transition_df, transition_metrics = compare_pmv_transition(
                 minute_df,
-                fixed_clo=fixed_clo,
+                fixed_clo=clo_base,
                 comfort_lower=-0.5,
                 comfort_upper=0.5,
             )
+
+            valid_transition_df = transition_df.dropna(subset=["pmv_conventional", "pmv_proposed"]).copy()
+            valid_transition_df["temp_diff_teff_tenv"] = (
+                pd.to_numeric(valid_transition_df["teff"], errors="coerce")
+                - pd.to_numeric(valid_transition_df["estimated_temp"], errors="coerce")
+            )
+            mean_conventional_pmv = float(valid_transition_df["pmv_conventional"].mean())
+            mean_proposed_pmv = float(valid_transition_df["pmv_proposed"].mean())
+            final_conventional_pmv = float(valid_transition_df["pmv_conventional"].iloc[-1])
+            final_proposed_pmv = float(valid_transition_df["pmv_proposed"].iloc[-1])
+            final_pmv_diff = final_proposed_pmv - final_conventional_pmv
+            mean_temp_diff = float(valid_transition_df["temp_diff_teff_tenv"].mean())
+            max_abs_temp_diff = float(valid_transition_df["temp_diff_teff_tenv"].abs().max())
+
+            if max_abs_temp_diff < 0.001:
+                st.info("Tenv と Teff がほぼ同じため、PMV差分も0に近くなっています。予定の環境遷移、ΔT、Teff計算結果を確認してください。")
+            elif transition_metrics["max_abs_pmv_diff"] < 0.001:
+                st.info("Tenv と Teff に差はありますが、PMV差分が非常に小さいため、丸め表示では0.000に見えています。")
 
             plot_df = transition_df[["datetime", "pmv_conventional", "pmv_proposed"]].set_index("datetime")
             plot_df = plot_df.rename(columns={
@@ -1078,26 +1097,45 @@ with tab6:
             })
             st.line_chart(diff_plot_df)
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("平均PMV差", f"{transition_metrics['mean_pmv_diff']:+.3f}")
-            m2.metric("最大PMV差", f"{transition_metrics['max_abs_pmv_diff']:.3f}")
-            m3.metric("快適範囲内割合（従来）", f"{transition_metrics['conventional_comfort_ratio']:.1f} %")
-            m4.metric("快適範囲内割合（提案）", f"{transition_metrics['proposed_comfort_ratio']:.1f} %")
+            st.markdown("#### 最終時刻のPMV")
+            f1, f2, f3 = st.columns(3)
+            f1.metric("従来手法PMV（最終）", f"{final_conventional_pmv:+.4f}")
+            f2.metric("提案手法PMV（最終）", f"{final_proposed_pmv:+.4f}")
+            f3.metric("PMV差（最終）", f"{final_pmv_diff:+.4f}")
+
+            st.markdown("#### 一日平均のPMV")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("従来手法PMV平均", f"{mean_conventional_pmv:+.4f}")
+            m2.metric("提案手法PMV平均", f"{mean_proposed_pmv:+.4f}")
+            m3.metric("平均PMV差", f"{transition_metrics['mean_pmv_diff']:+.4f}")
+            m4.metric("最大PMV差", f"{transition_metrics['max_abs_pmv_diff']:.4f}")
+            m5.metric(
+                "快適範囲内割合",
+                f"{transition_metrics['conventional_comfort_ratio']:.1f} / {transition_metrics['proposed_comfort_ratio']:.1f} %",
+                help="左が従来手法、右が提案手法です。",
+            )
+            t1, t2 = st.columns(2)
+            t1.metric("平均温度差（Teff - Tenv）", f"{mean_temp_diff:+.3f} ℃")
+            t2.metric("最大温度差（絶対値）", f"{max_abs_temp_diff:.3f} ℃")
 
             st.markdown("### 自動考察")
             st.write(
-                "・同じCLO値を着用した場合でも、提案手法では一次遅れモデルにより、環境遷移直後のPMV変化が従来手法と異なる可能性があります。"
+                f"・PMV判定誤差では、提案手法で推薦された CLO_base={clo_base:.2f} を両手法で共通に使用しています。"
             )
             st.write(
-                f"・平均PMV差は {transition_metrics['mean_pmv_diff']:+.3f}、最大PMV差は {transition_metrics['max_abs_pmv_diff']:.3f} でした。"
+                f"・最終時刻のPMV差は {final_pmv_diff:+.3f}、一日平均PMV差は {transition_metrics['mean_pmv_diff']:+.3f} でした。"
             )
             st.write(
                 "・これは、PMVへ入力する温度を環境温度そのものではなく、人体温熱状態の時間遅れを反映した Teff に変更したためと考えられます。"
             )
 
             with st.expander("比較データを確認する"):
+                transition_df["temp_diff_teff_tenv"] = (
+                    pd.to_numeric(transition_df["teff"], errors="coerce")
+                    - pd.to_numeric(transition_df["estimated_temp"], errors="coerce")
+                )
                 display_eval_cols = [
-                    "datetime", "estimated_temp", "teff", "rh", "v", "met",
+                    "datetime", "estimated_temp", "teff", "temp_diff_teff_tenv", "rh", "v", "met",
                     "pmv_conventional", "pmv_proposed", "pmv_diff"
                 ]
                 st.dataframe(transition_df[display_eval_cols].head(500), use_container_width=True)
